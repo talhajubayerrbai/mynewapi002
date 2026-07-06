@@ -38,7 +38,6 @@ jobs:
     needs: [test]
     outputs:
       instance_public_ip: ${{ steps.tf_outputs.outputs.instance_public_ip }}
-      alb_dns_name_b64: ${{ steps.tf_outputs.outputs.alb_dns_name_b64 }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -77,11 +76,10 @@ jobs:
         working-directory: terraform
         run: |
           echo "instance_public_ip=$(terraform output -raw instance_public_ip)" >> "$GITHUB_OUTPUT"
-          # Base64-encode the ALB DNS name so GitHub's secret scanner does not
-          # suppress the output (the project name appears in the DNS name and
-          # PROJECT_NAME is a registered secret).
-          ALB_DNS="$(terraform output -raw alb_dns_name)"
-          echo "alb_dns_name_b64=$(echo -n "$ALB_DNS" | base64 -w 0)" >> "$GITHUB_OUTPUT"
+          # The ALB DNS name is NOT passed as a job output because GitHub
+          # masks any value (or its base64 form) that contains a registered
+          # secret (PROJECT_NAME).  Instead it is stored in SSM Parameter
+          # Store by Terraform and fetched directly in the Verify job.
 
   configure:
     name: Configure
@@ -137,6 +135,13 @@ jobs:
     runs-on: ubuntu-latest
     needs: [provision, configure]
     steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
       - name: Wait for ALB to become healthy
         run: |
           echo "Waiting for ALB health checks to stabilise..."
@@ -144,8 +149,14 @@ jobs:
 
       - name: Smoke test - check app endpoint
         run: |-
-          # Decode the base64-encoded ALB DNS name (avoids GitHub secret masking)
-          ALB_DNS="$(echo '${{ needs.provision.outputs.alb_dns_name_b64 }}' | base64 -d)"
+          # Fetch the ALB DNS name from SSM Parameter Store.
+          # This avoids GitHub's job-output secret-masking, which suppresses
+          # any output value whose content (or base64 form) matches a
+          # registered secret such as PROJECT_NAME.
+          ALB_DNS=$(aws ssm get-parameter \
+            --name "/${{ secrets.PROJECT_NAME }}/alb_dns_name" \
+            --query "Parameter.Value" \
+            --output text)
           echo "ALB DNS: $ALB_DNS"
           STATUS=$(curl -Lsf -o /dev/null -w "%{http_code}" "http://$ALB_DNS/health/")
           echo "HTTP status: $STATUS"

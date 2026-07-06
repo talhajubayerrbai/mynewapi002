@@ -287,6 +287,24 @@ resource "aws_lb_target_group_attachment" "app" {
 }
 
 # ---------------------------------------------------------------------------
+# SSM Parameter – store the ALB DNS name so the CI verify job can
+# retrieve it directly via the AWS CLI, bypassing GitHub's job-output
+# secret-masking which suppresses any value containing the project name
+# (or its base64 equivalent).
+# ---------------------------------------------------------------------------
+
+resource "aws_ssm_parameter" "alb_dns" {
+  name  = "/${var.project_name}/alb_dns_name"
+  type  = "String"
+  value = aws_lb.main.dns_name
+
+  tags = {
+    Name    = "${var.project_name}-alb-dns"
+    Project = var.project_name
+  }
+}
+
+# ---------------------------------------------------------------------------
 # Outputs
 # ---------------------------------------------------------------------------
 
