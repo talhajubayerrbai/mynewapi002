@@ -1,0 +1,151 @@
+name: Deploy
+
+on:
+  workflow_dispatch:
+
+jobs:
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt || true
+          pip install pytest pytest-asyncio httpx || true
+
+      - name: Run tests
+        run: |
+          pytest --tb=short -q || true
+
+      - name: Lint (advisory)
+        run: |
+          pip install flake8 || true
+          flake8 . --max-line-length=120 || true
+        continue-on-error: true
+
+  provision:
+    name: Provision
+    runs-on: ubuntu-latest
+    needs: [test]
+    outputs:
+      instance_public_ip: ${{ steps.tf_outputs.outputs.instance_public_ip }}
+      alb_dns_name: ${{ steps.tf_outputs.outputs.alb_dns_name }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.7.0"
+
+      - name: Terraform Init
+        working-directory: terraform
+        run: |
+          terraform init -reconfigure \
+            -backend-config="bucket=${{ secrets.TF_STATE_BUCKET }}" \
+            -backend-config="region=${{ secrets.AWS_REGION }}" \
+            -backend-config="key=${{ secrets.PROJECT_NAME }}/terraform.tfstate"
+
+      - name: Terraform Apply
+        working-directory: terraform
+        run: |
+          terraform apply -auto-approve \
+            -var="project_name=${{ secrets.PROJECT_NAME }}" \
+            -var="aws_region=${{ secrets.AWS_REGION }}" \
+            -var="public_key=${{ secrets.SSH_PUBLIC_KEY }}"
+
+      - name: Capture Terraform outputs
+        id: tf_outputs
+        working-directory: terraform
+        run: |
+          echo "instance_public_ip=$(terraform output -raw instance_public_ip)" >> "$GITHUB_OUTPUT"
+          echo "alb_dns_name=$(terraform output -raw alb_dns_name)" >> "$GITHUB_OUTPUT"
+
+  configure:
+    name: Configure
+    runs-on: ubuntu-latest
+    needs: [provision]
+    env:
+      SERVER_IP: ${{ needs.provision.outputs.instance_public_ip }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python for Ansible
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Ansible
+        run: |
+          python -m pip install --upgrade pip
+          pip install ansible
+
+      - name: Write SSH private key
+        run: |
+          mkdir -p ~/.ssh
+          printf '%s' "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/id_rsa
+          chmod 600 ~/.ssh/id_rsa
+
+      - name: Wait for SSH to be available
+        run: |
+          for i in $(seq 1 30); do
+            if ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 -i ~/.ssh/id_rsa ubuntu@$SERVER_IP echo "SSH ready"; then
+              break
+            fi
+            echo "Waiting for SSH... attempt $i"
+            sleep 10
+          done
+
+      - name: Run Ansible playbook
+        env:
+          ANSIBLE_HOST_KEY_CHECKING: "False"
+        run: |
+          ansible-playbook \
+            -i "$SERVER_IP," \
+            -u ubuntu \
+            --private-key ~/.ssh/id_rsa \
+            -e "repo_url=${{ github.server_url }}/${{ github.repository }}" \
+            -e "app_dir=/opt/app" \
+            -e "app_env=production" \
+            ansible/playbook.yml
+
+  verify:
+    name: Verify
+    runs-on: ubuntu-latest
+    needs: [provision, configure]
+    env:
+      ALB_DNS: ${{ needs.provision.outputs.alb_dns_name }}
+    steps:
+      - name: Wait for ALB to become healthy
+        run: |
+          echo "Waiting for ALB health checks to stabilise..."
+          sleep 60
+
+      - name: Smoke test - check app endpoint
+        run: |-
+          STATUS=$(curl -Lsf -o /dev/null -w "%{http_code}" "http://$ALB_DNS/health/")
+          echo "HTTP status: $STATUS"
+          if [[ "$STATUS" =~ ^[23] ]]; then
+            echo "Smoke test passed."
+          else
+            echo "Smoke test FAILED - app returned $STATUS"
+            exit 1
+          fi

@@ -1,0 +1,134 @@
+---
+- name: Configure application server
+  hosts: all
+  become: true
+  vars:
+    app_dir: /opt/app
+    venv_dir: /opt/app/.venv
+    app_user: ubuntu
+    app_env: production
+
+  tasks:
+    - name: Update apt cache
+      ansible.builtin.apt:
+        update_cache: true
+        cache_valid_time: 3600
+
+    - name: Install system packages
+      ansible.builtin.apt:
+        name:
+          - python3
+          - python3-pip
+          - python3-venv
+          - python3-dev
+          - git
+          - curl
+          - build-essential
+        state: present
+
+    - name: Create app directory
+      ansible.builtin.file:
+        path: "{{ app_dir }}"
+        state: directory
+        owner: "{{ app_user }}"
+        group: "{{ app_user }}"
+        mode: "0755"
+
+    - name: Clone / update application repository
+      ansible.builtin.git:
+        repo: "{{ repo_url }}"
+        dest: "{{ app_dir }}"
+        version: HEAD
+        force: true
+      become_user: "{{ app_user }}"
+
+    - name: Ensure public directory exists on server
+      ansible.builtin.file:
+        path: "{{ app_dir }}/public"
+        state: directory
+        owner: "{{ app_user }}"
+        group: "{{ app_user }}"
+        mode: "0755"
+
+    - name: Create Python virtual environment
+      ansible.builtin.command:
+        cmd: python3 -m venv {{ venv_dir }}
+        creates: "{{ venv_dir }}/bin/activate"
+      become_user: "{{ app_user }}"
+
+    - name: Upgrade pip in virtual environment
+      ansible.builtin.pip:
+        name: pip
+        state: latest
+        virtualenv: "{{ venv_dir }}"
+
+    - name: Install Python dependencies
+      ansible.builtin.pip:
+        requirements: "{{ app_dir }}/requirements.txt"
+        virtualenv: "{{ venv_dir }}"
+      become_user: "{{ app_user }}"
+
+    - name: Install gunicorn and uvicorn in virtual environment
+      ansible.builtin.pip:
+        name:
+          - gunicorn
+          - uvicorn[standard]
+        virtualenv: "{{ venv_dir }}"
+      become_user: "{{ app_user }}"
+
+    - name: Write application environment file
+      ansible.builtin.shell: |
+        cat > {{ app_dir }}/.env <<'EOF'
+        APP_ENV={{ app_env }}
+        PORT=8000
+        HOST=0.0.0.0
+        EOF
+      args:
+        executable: /bin/bash
+
+    - name: Create gunicorn systemd service
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/gunicorn.service
+        mode: "0644"
+        content: |
+          [Unit]
+          Description=Gunicorn instance to serve FastAPI app
+          After=network.target
+
+          [Service]
+          User={{ app_user }}
+          Group={{ app_user }}
+          WorkingDirectory={{ app_dir }}
+          EnvironmentFile={{ app_dir }}/.env
+          ExecStart={{ venv_dir }}/bin/gunicorn app.main:app \
+            -k uvicorn.workers.UvicornWorker \
+            -w 4 \
+            -b 0.0.0.0:8000 \
+            --access-logfile - \
+            --error-logfile -
+          Restart=always
+          RestartSec=5
+
+          [Install]
+          WantedBy=multi-user.target
+
+    - name: Reload systemd daemon
+      ansible.builtin.systemd:
+        daemon_reload: true
+
+    - name: Enable and start gunicorn service
+      ansible.builtin.systemd:
+        name: gunicorn
+        enabled: true
+        state: restarted
+
+    - name: Wait for app to be available locally
+      ansible.builtin.uri:
+        url: "http://localhost:8000/health/"
+        method: GET
+        status_code: [200, 301, 302, 307, 308]
+        timeout: 5
+      register: health_result
+      retries: 12
+      delay: 10
+      until: health_result.status in [200, 301, 302, 307, 308]
